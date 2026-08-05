@@ -16,12 +16,11 @@ type ServerBoundDataStoreHandler struct {
 
 func (d *ServerBoundDataStoreHandler) Handle(p packet.Packet, s *Session, _ *world.Tx, _ Controllable) error {
 	pk := p.(*packet.ServerBoundDataStore)
-
-	property := pk.Update.Property
-	if !strings.HasPrefix(property, "custom_form_data_") && !strings.HasPrefix(property, "message_box_data_") {
+	if pk.Update.DataStoreName != "minecraft" {
 		return nil
 	}
 
+	property := pk.Update.Property
 	const sep = "_data_"
 	i := strings.LastIndex(property, sep)
 	if i < 0 {
@@ -34,32 +33,64 @@ func (d *ServerBoundDataStoreHandler) Handle(p packet.Packet, s *Session, _ *wor
 
 	d.h.mu.Lock()
 	af := d.h.forms[uint32(id)]
+	active := true
+	for instanceID := range d.h.forms {
+		if instanceID > uint32(id) {
+			active = false
+			break
+		}
+	}
+	if af == nil || property != af.property {
+		active = false
+	}
 	d.h.mu.Unlock()
 
-	if af == nil {
+	if !active {
 		return nil
 	}
 
-	if af.form.HandleUpdate(pk.Update.Path, dataStoreControlToUpdateValue(pk.Update)) {
+	value, valid := dataStoreControlToUpdateValue(pk.Update)
+	if !valid {
+		return nil
+	}
+
+	result, accepted := af.handleUpdate(pk.Update.Path, value)
+	if !accepted {
+		return nil
+	}
+	if result.Close {
+		af.sendMu.Lock()
+		af.sendMu.Unlock()
 		d.h.mu.Lock()
-		delete(d.h.forms, af.instanceID)
+		if d.h.forms[af.instanceID] == af {
+			delete(d.h.forms, af.instanceID)
+		}
 		d.h.mu.Unlock()
-		af.form.OnClose(ddui.Closed)
+		af.unbind()
 		s.writePacket(&packet.ClientBoundDataDrivenUICloseScreen{
 			FormID: protocol.Option(af.formID),
 		})
 		sendDataStoreCleanup(s, af)
+		if result.Complete == nil {
+			af.form.OnClose(ddui.Closed)
+		} else {
+			result.Complete()
+		}
+	} else if result.Complete != nil {
+		result.Complete()
 	}
 	return nil
 }
 
-func dataStoreControlToUpdateValue(u protocol.DataStoreUpdate) ddui.UpdateValue {
+func dataStoreControlToUpdateValue(u protocol.DataStoreUpdate) (ddui.UpdateValue, bool) {
 	switch u.ControlType {
 	case protocol.DataStoreControlDouble:
-		return ddui.UpdateValue{Kind: ddui.UpdateKindFloat, Float: u.DoubleValue}
+		return ddui.UpdateValue{Kind: ddui.UpdateKindFloat, Float: u.DoubleValue}, true
 	case protocol.DataStoreControlBoolean:
-		return ddui.UpdateValue{Kind: ddui.UpdateKindBool, Bool: u.BoolValue}
+		return ddui.UpdateValue{Kind: ddui.UpdateKindBool, Bool: u.BoolValue}, true
+	case protocol.DataStoreControlString:
+		return ddui.UpdateValue{Kind: ddui.UpdateKindString, String: u.StringValue}, true
 	default:
-		return ddui.UpdateValue{Kind: ddui.UpdateKindString, String: u.StringValue}
+		return ddui.UpdateValue{}, false
 	}
 }

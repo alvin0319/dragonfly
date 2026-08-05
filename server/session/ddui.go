@@ -1,6 +1,7 @@
 package session
 
 import (
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -17,61 +18,79 @@ type DDUIFormHandler struct {
 	forms          map[uint32]*activeDDUIForm
 	nextFormID     atomic.Uint32
 	nextInstanceID atomic.Uint32
+	nextBindingID  atomic.Uint64
 }
 
-// activeDDUIForm tracks a single open DDUI form.
 type activeDDUIForm struct {
 	form                ddui.Form
 	formID              uint32
 	instanceID          uint32
+	bindingID           uint64
 	property            string
 	propertyUpdateCount uint32
+	unbind              func()
+	closed              atomic.Bool
+	updateMu            sync.Mutex
+	sendMu              sync.Mutex
+	published           bool
+	pathUpdateCounts    map[string]uint32
+	pending             []pendingDDUIUpdate
+}
+
+type pendingDDUIUpdate struct {
+	update              ddui.UpdateNotification
+	propertyUpdateCount uint32
+	pathUpdateCount     uint32
 }
 
 // SendDDUIForm sends f to the client via s, registering it as an active form.
 func (h *DDUIFormHandler) SendDDUIForm(f ddui.Form, s *Session) {
 	instanceID := h.nextInstanceID.Add(1)
 	formID := h.nextFormID.Add(1)
+	screenID := f.ScreenID()
 
-	property := deriveProperty(f.ScreenID(), instanceID)
+	property := deriveProperty(screenID, instanceID)
+	bindingID := h.nextBindingID.Add(1)
 
 	af := &activeDDUIForm{
 		form:                f,
 		formID:              formID,
 		instanceID:          instanceID,
+		bindingID:           bindingID,
 		property:            property,
 		propertyUpdateCount: 1,
+		pathUpdateCounts:    make(map[string]uint32),
 	}
+
+	onUpdate := func(update ddui.UpdateNotification) {
+		af.sendMu.Lock()
+		defer af.sendMu.Unlock()
+		if af.closed.Load() {
+			return
+		}
+		propertyUpdateCount, pathUpdateCount := af.recordUpdate(update.Path)
+		if !af.published {
+			af.pending = append(af.pending, pendingDDUIUpdate{
+				update:              update,
+				propertyUpdateCount: propertyUpdateCount,
+				pathUpdateCount:     pathUpdateCount,
+			})
+			return
+		}
+		sendDataStoreUpdate(s, property, update, propertyUpdateCount, pathUpdateCount)
+	}
+	if bound, ok := f.(ddui.BindingForm); ok {
+		af.unbind = bound.BindSendFrom(bindingID, onUpdate)
+	} else {
+		af.unbind = f.BindSend(onUpdate)
+	}
+	if af.unbind == nil {
+		af.unbind = func() {}
+	}
+	desc := f.Describe()
 
 	h.mu.Lock()
 	h.forms[instanceID] = af
-	h.mu.Unlock()
-
-	f.BindSend(func(_ ddui.UpdateNotification) {
-		h.mu.Lock()
-		if _, active := h.forms[instanceID]; !active {
-			h.mu.Unlock()
-			return
-		}
-		af.propertyUpdateCount++
-		count := af.propertyUpdateCount
-		h.mu.Unlock()
-
-		s.writePacket(&packet.ClientBoundDataStore{
-			Updates: []protocol.DataStoreChangeEntry{
-				{
-					ChangeType: protocol.DataStoreChangeTypeChange,
-					Change: protocol.DataStoreChange{
-						DataStoreName: "minecraft",
-						Property:      property,
-						UpdateCount:   count,
-						NewValue:      serializeForm(f.Describe()),
-					},
-				},
-			},
-		})
-	})
-
 	s.writePacket(&packet.ClientBoundDataStore{
 		Updates: []protocol.DataStoreChangeEntry{
 			{
@@ -80,15 +99,37 @@ func (h *DDUIFormHandler) SendDDUIForm(f ddui.Form, s *Session) {
 					DataStoreName: "minecraft",
 					Property:      property,
 					UpdateCount:   1,
-					NewValue:      serializeForm(f.Describe()),
+					NewValue:      serializeForm(screenID, desc),
 				},
 			},
 		},
 	})
 	s.writePacket(&packet.ClientBoundDataDrivenUIShowScreen{
-		ScreenID:       f.ScreenID(),
+		ScreenID:       screenID,
 		FormID:         formID,
 		DataInstanceID: protocol.Option(instanceID),
+	})
+	h.mu.Unlock()
+
+	af.sendMu.Lock()
+	if !af.closed.Load() {
+		af.published = true
+		for _, update := range af.pending {
+			sendDataStoreUpdate(s, property, update.update, update.propertyUpdateCount, update.pathUpdateCount)
+		}
+	}
+	af.pending = nil
+	af.sendMu.Unlock()
+}
+
+func sendDataStoreUpdate(s *Session, property string, update ddui.UpdateNotification, propertyUpdateCount, pathUpdateCount uint32) {
+	s.writePacket(&packet.ClientBoundDataStore{
+		Updates: []protocol.DataStoreChangeEntry{
+			{
+				ChangeType: protocol.DataStoreChangeTypeUpdate,
+				Update:     serializeUpdate(property, update, propertyUpdateCount, pathUpdateCount),
+			},
+		},
 	})
 }
 
@@ -105,16 +146,81 @@ func (h *DDUIFormHandler) CloseDDUIForms(s *Session) {
 	if len(active) == 0 {
 		return
 	}
+	sort.Slice(active, func(i, j int) bool {
+		return active[i].instanceID > active[j].instanceID
+	})
+
+	claimed := active[:0]
+	for _, af := range active {
+		if !af.claim() {
+			continue
+		}
+		af.unbind()
+		claimed = append(claimed, af)
+	}
+	if len(claimed) == 0 {
+		return
+	}
 
 	s.writePacket(&packet.ClientBoundDataDrivenUICloseScreen{})
 
-	for _, af := range active {
-		af.form.OnClose(ddui.CloseReasonProgrammaticAll)
+	for _, af := range claimed {
 		sendDataStoreCleanup(s, af)
+	}
+	for _, af := range claimed {
+		af.form.OnClose(ddui.CloseReasonProgrammaticAll)
 	}
 }
 
-// sendDataStoreCleanup nulls the data store property for af.
+func (h *DDUIFormHandler) discardDDUIForms() {
+	h.mu.Lock()
+	active := h.forms
+	h.forms = make(map[uint32]*activeDDUIForm)
+	h.mu.Unlock()
+
+	for _, af := range active {
+		if !af.claim() {
+			continue
+		}
+		af.unbind()
+	}
+}
+
+func (af *activeDDUIForm) claim() bool {
+	if !af.closed.CompareAndSwap(false, true) {
+		return false
+	}
+	af.sendMu.Lock()
+	af.sendMu.Unlock()
+	return true
+}
+
+func (af *activeDDUIForm) handleUpdate(path string, value ddui.UpdateValue) (ddui.UpdateResult, bool) {
+	af.updateMu.Lock()
+	defer af.updateMu.Unlock()
+	if af.closed.Load() {
+		return ddui.UpdateResult{}, false
+	}
+	if bound, ok := af.form.(ddui.BindingForm); ok {
+		result := bound.HandleUpdateFrom(af.bindingID, path, value)
+		if result.Close {
+			af.closed.Store(true)
+		}
+		return result, true
+	}
+	result := af.form.HandleUpdate(path, value)
+	if result.Close {
+		af.closed.Store(true)
+	}
+	return result, true
+}
+
+func (af *activeDDUIForm) recordUpdate(path string) (propertyUpdateCount, pathUpdateCount uint32) {
+	af.propertyUpdateCount++
+	af.pathUpdateCounts[path]++
+	return af.propertyUpdateCount, af.pathUpdateCounts[path]
+}
+
 func sendDataStoreCleanup(s *Session, af *activeDDUIForm) {
 	s.writePacket(&packet.ClientBoundDataStore{
 		Updates: []protocol.DataStoreChangeEntry{
@@ -123,7 +229,7 @@ func sendDataStoreCleanup(s *Session, af *activeDDUIForm) {
 				Change: protocol.DataStoreChange{
 					DataStoreName: "minecraft",
 					Property:      af.property,
-					UpdateCount:   af.propertyUpdateCount + 2,
+					UpdateCount:   af.propertyUpdateCount + 1,
 					NewValue:      protocol.DataStorePropertyValue{Type: protocol.DataStorePropertyTypeNone},
 				},
 			},
@@ -131,30 +237,28 @@ func sendDataStoreCleanup(s *Session, af *activeDDUIForm) {
 	})
 }
 
-// deriveProperty converts a DDUI screen ID and instance ID to a data store property name.
 func deriveProperty(screenID string, instanceID uint32) string {
 	base := strings.TrimPrefix(screenID, "minecraft:")
 	base = strings.ReplaceAll(base, ":", "_")
 	return base + "_data_" + strconv.FormatUint(uint64(instanceID), 10)
 }
 
-// serializeForm converts a ddui.FormDescriptor to a DataStorePropertyValue map.
-func serializeForm(desc ddui.FormDescriptor) protocol.DataStorePropertyValue {
-	if desc.Body != "" || desc.Button1.Label != "" || desc.Button2.Label != "" {
+func serializeForm(screenID string, desc ddui.FormDescriptor) protocol.DataStorePropertyValue {
+	if screenID == "minecraft:message_box" {
 		return serializeMessageBox(desc)
 	}
 	return serializeCustomForm(desc)
 }
 
-// serializeCustomForm builds the nested data store map for a CustomForm.
 func serializeCustomForm(desc ddui.FormDescriptor) protocol.DataStorePropertyValue {
 	entries := make([]protocol.DataStoreMapEntry, 0, 3)
 
 	if desc.HasCloseButton {
 		entries = append(entries, dsEntry("closeButton", dsMap(
-			dsEntry("button_visible", dsBool(true)),
-			dsEntry("label", dsStr("Close")),
+			dsEntry("button_visible", dsBool(desc.CloseButton.Visible)),
+			dsEntry("label", dsStr(desc.CloseButton.Label)),
 			dsEntry("onClick", dsInt(0)),
+			dsEntry("visible", dsBool(desc.CloseButton.Visible)),
 		)))
 	}
 
@@ -171,110 +275,157 @@ func serializeCustomForm(desc ddui.FormDescriptor) protocol.DataStorePropertyVal
 	return dsMap(entries...)
 }
 
-// serializeMessageBox builds the nested data store map for a MessageBox.
-func serializeMessageBox(desc ddui.FormDescriptor) protocol.DataStorePropertyValue {
-	btn1 := []protocol.DataStoreMapEntry{
-		dsEntry("label", dsStr(desc.Button1.Label)),
-		dsEntry("onClick", dsInt(0)),
+func serializeUpdate(property string, update ddui.UpdateNotification, propertyUpdateCount, pathUpdateCount uint32) protocol.DataStoreUpdate {
+	u := protocol.DataStoreUpdate{
+		DataStoreName:       "minecraft",
+		Property:            property,
+		Path:                update.Path,
+		PropertyUpdateCount: propertyUpdateCount,
+		PathUpdateCount:     pathUpdateCount,
 	}
-	if desc.Button1.Tooltip != "" {
-		btn1 = append(btn1, dsEntry("tooltip", dsStr(desc.Button1.Tooltip)))
+	switch update.Value.Kind {
+	case ddui.UpdateKindFloat:
+		u.ControlType = protocol.DataStoreControlDouble
+		u.DoubleValue = update.Value.Float
+	case ddui.UpdateKindBool:
+		u.ControlType = protocol.DataStoreControlBoolean
+		u.BoolValue = update.Value.Bool
+	case ddui.UpdateKindString:
+		u.ControlType = protocol.DataStoreControlString
+		u.StringValue = update.Value.String
 	}
-
-	btn2 := []protocol.DataStoreMapEntry{
-		dsEntry("label", dsStr(desc.Button2.Label)),
-		dsEntry("onClick", dsInt(0)),
-	}
-	if desc.Button2.Tooltip != "" {
-		btn2 = append(btn2, dsEntry("tooltip", dsStr(desc.Button2.Tooltip)))
-	}
-
-	return dsMap(
-		dsEntry("body", dsStr(desc.Body)),
-		dsEntry("button1", dsMap(btn1...)),
-		dsEntry("button2", dsMap(btn2...)),
-		dsEntry("title", dsStr(desc.Title)),
-	)
+	return u
 }
 
-// serializeElement converts a single ElementDescriptor to its data store map representation.
+func serializeMessageBox(desc ddui.FormDescriptor) protocol.DataStorePropertyValue {
+	entries := []protocol.DataStoreMapEntry{
+		dsEntry("body", dsStr(desc.Body)),
+	}
+	if desc.HasButton1 {
+		entries = append(entries, dsEntry("button1", serializeMessageBoxButton(desc.Button1)))
+	}
+	if desc.HasButton2 {
+		entries = append(entries, dsEntry("button2", serializeMessageBoxButton(desc.Button2)))
+	}
+	entries = append(entries, dsEntry("title", dsStr(desc.Title)))
+	return dsMap(entries...)
+}
+
+func serializeMessageBoxButton(button ddui.ButtonDescriptor) protocol.DataStorePropertyValue {
+	entries := []protocol.DataStoreMapEntry{
+		dsEntry("button_visible", dsBool(true)),
+		dsEntry("label", dsStr(button.Label)),
+		dsEntry("onClick", dsInt(0)),
+		dsEntry("visible", dsBool(true)),
+	}
+	if button.Tooltip != "" {
+		entries = append(entries,
+			dsEntry("tooltip", dsStr(button.Tooltip)),
+			dsEntry("tooltip_visible", dsBool(true)),
+		)
+	}
+	return dsMap(entries...)
+}
+
 func serializeElement(e ddui.ElementDescriptor) protocol.DataStorePropertyValue {
 	switch e.Kind {
 	case ddui.ElementSpacer:
 		return dsMap(
-			dsEntry("spacer_visible", dsBool(true)),
-			dsEntry("visible", dsBool(true)),
+			dsEntry("spacer_visible", dsBool(e.Visible)),
+			dsEntry("visible", dsBool(e.Visible)),
 		)
 	case ddui.ElementDivider:
 		return dsMap(
-			dsEntry("divider_visible", dsBool(true)),
-			dsEntry("visible", dsBool(true)),
+			dsEntry("divider_visible", dsBool(e.Visible)),
+			dsEntry("visible", dsBool(e.Visible)),
 		)
 	case ddui.ElementLabel:
 		return dsMap(
-			dsEntry("label_visible", dsBool(true)),
+			dsEntry("label_visible", dsBool(e.Visible)),
 			dsEntry("text", dsStr(e.StringValue)),
-			dsEntry("visible", dsBool(true)),
+			dsEntry("visible", dsBool(e.Visible)),
+		)
+	case ddui.ElementHeader:
+		return dsMap(
+			dsEntry("header_visible", dsBool(e.Visible)),
+			dsEntry("text", dsStr(e.StringValue)),
+			dsEntry("visible", dsBool(e.Visible)),
 		)
 	case ddui.ElementTextField:
 		return dsMap(
-			dsEntry("visible", dsBool(true)),
 			dsEntry("description", dsStr(e.Description)),
+			dsEntry("disabled", dsBool(e.Disabled)),
 			dsEntry("label", dsStr(e.Label)),
 			dsEntry("text", dsStr(e.StringValue)),
-			dsEntry("textfield_visible", dsBool(true)),
+			dsEntry("textfield_visible", dsBool(e.Visible)),
+			dsEntry("visible", dsBool(e.Visible)),
 		)
 	case ddui.ElementDropdown:
 		return dsMap(
-			dsEntry("visible", dsBool(true)),
-			dsEntry("dropdown_visible", dsBool(true)),
+			dsEntry("description", dsStr(e.Description)),
+			dsEntry("disabled", dsBool(e.Disabled)),
+			dsEntry("dropdown_visible", dsBool(e.Visible)),
 			dsEntry("items", serializeDropdownItems(e.Options)),
 			dsEntry("label", dsStr(e.Label)),
 			dsEntry("value", dsInt(int64(e.IntValue))),
+			dsEntry("visible", dsBool(e.Visible)),
 		)
 	case ddui.ElementToggle:
 		return dsMap(
+			dsEntry("description", dsStr(e.Description)),
+			dsEntry("disabled", dsBool(e.Disabled)),
 			dsEntry("label", dsStr(e.Label)),
-			dsEntry("toggle_visible", dsBool(true)),
 			dsEntry("toggled", dsBool(e.BoolValue)),
-			dsEntry("visible", dsBool(true)),
+			dsEntry("toggle_visible", dsBool(e.Visible)),
+			dsEntry("visible", dsBool(e.Visible)),
 		)
 	case ddui.ElementSlider:
 		return dsMap(
-			dsEntry("visible", dsBool(true)),
 			dsEntry("description", dsStr(e.Description)),
-			dsEntry("slider_visible", dsBool(true)),
+			dsEntry("disabled", dsBool(e.Disabled)),
 			dsEntry("label", dsStr(e.Label)),
-			dsEntry("maxValue", dsInt(int64(e.Max))),
-			dsEntry("minValue", dsInt(int64(e.Min))),
-			dsEntry("step", dsInt(int64(e.Step))),
-			dsEntry("value", dsInt(int64(e.FloatValue))),
+			dsEntry("maxValue", dsFloat(e.Max)),
+			dsEntry("minValue", dsFloat(e.Min)),
+			dsEntry("slider_visible", dsBool(e.Visible)),
+			dsEntry("step", dsFloat(e.Step)),
+			dsEntry("value", dsFloat(e.FloatValue)),
+			dsEntry("visible", dsBool(e.Visible)),
 		)
 	case ddui.ElementButton:
-		return dsMap(
-			dsEntry("button_visible", dsBool(true)),
+		entries := []protocol.DataStoreMapEntry{
+			dsEntry("button_visible", dsBool(e.Visible)),
+			dsEntry("disabled", dsBool(e.Disabled)),
 			dsEntry("label", dsStr(e.Label)),
 			dsEntry("onClick", dsInt(0)),
-			dsEntry("visible", dsBool(true)),
-		)
+			dsEntry("visible", dsBool(e.Visible)),
+		}
+		if e.Tooltip != "" {
+			entries = append(entries,
+				dsEntry("tooltip", dsStr(e.Tooltip)),
+				dsEntry("tooltip_visible", dsBool(true)),
+			)
+		}
+		return dsMap(entries...)
 	}
 	return dsMap()
 }
 
-// serializeDropdownItems encodes dropdown options as a length-keyed data store map.
 func serializeDropdownItems(opts []ddui.DropdownOption) protocol.DataStorePropertyValue {
 	entries := make([]protocol.DataStoreMapEntry, 0, len(opts)+1)
 	for i, opt := range opts {
-		entries = append(entries, dsEntry(strconv.Itoa(i), dsMap(
+		item := []protocol.DataStoreMapEntry{
 			dsEntry("label", dsStr(opt.Label)),
 			dsEntry("value", dsInt(int64(opt.Value))),
-		)))
+		}
+		if opt.Description != "" {
+			item = append(item, dsEntry("description", dsStr(opt.Description)))
+		}
+		entries = append(entries, dsEntry(strconv.Itoa(i), dsMap(item...)))
 	}
 	entries = append(entries, dsEntry("length", dsInt(int64(len(opts)))))
 	return dsMap(entries...)
 }
 
-// dsMap returns a map-typed DataStorePropertyValue from the given entries.
 func dsMap(entries ...protocol.DataStoreMapEntry) protocol.DataStorePropertyValue {
 	return protocol.DataStorePropertyValue{
 		Type:     protocol.DataStorePropertyTypeMap,
@@ -282,22 +433,22 @@ func dsMap(entries ...protocol.DataStoreMapEntry) protocol.DataStorePropertyValu
 	}
 }
 
-// dsBool returns a bool-typed DataStorePropertyValue.
 func dsBool(v bool) protocol.DataStorePropertyValue {
 	return protocol.DataStorePropertyValue{Type: protocol.DataStorePropertyTypeBool, BoolValue: v}
 }
 
-// dsInt returns an int64-typed DataStorePropertyValue.
 func dsInt(v int64) protocol.DataStorePropertyValue {
 	return protocol.DataStorePropertyValue{Type: protocol.DataStorePropertyTypeInt64, Int64Value: v}
 }
 
-// dsStr returns a string-typed DataStorePropertyValue.
+func dsFloat(v float64) protocol.DataStorePropertyValue {
+	return protocol.DataStorePropertyValue{Type: protocol.DataStorePropertyTypeDouble, DoubleValue: v}
+}
+
 func dsStr(v string) protocol.DataStorePropertyValue {
 	return protocol.DataStorePropertyValue{Type: protocol.DataStorePropertyTypeString, StringValue: v}
 }
 
-// dsEntry returns a DataStoreMapEntry with the given key and value.
 func dsEntry(key string, value protocol.DataStorePropertyValue) protocol.DataStoreMapEntry {
 	return protocol.DataStoreMapEntry{Key: key, Value: value}
 }

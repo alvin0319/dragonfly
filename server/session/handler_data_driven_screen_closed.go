@@ -3,7 +3,6 @@ package session
 import (
 	"github.com/df-mc/dragonfly/server/player/ddui"
 	"github.com/df-mc/dragonfly/server/world"
-	"github.com/sandertv/gophertunnel/minecraft/protocol"
 	"github.com/sandertv/gophertunnel/minecraft/protocol/packet"
 )
 
@@ -12,21 +11,16 @@ type DataDrivenScreenClosedHandler struct {
 	h *DDUIFormHandler
 }
 
-// Handle ...
 func (d *DataDrivenScreenClosedHandler) Handle(p packet.Packet, s *Session, _ *world.Tx, _ Controllable) error {
 	pk := p.(*packet.ServerBoundDataDrivenScreenClosed)
 
-	formID, hasID := pk.FormID.Value()
-
 	d.h.mu.Lock()
 	var af *activeDDUIForm
-	if hasID {
-		for _, f := range d.h.forms {
-			if f.formID == formID {
-				af = f
-				delete(d.h.forms, f.instanceID)
-				break
-			}
+	for _, f := range d.h.forms {
+		if f.formID == pk.FormID {
+			af = f
+			delete(d.h.forms, f.instanceID)
+			break
 		}
 	}
 	d.h.mu.Unlock()
@@ -34,13 +28,13 @@ func (d *DataDrivenScreenClosedHandler) Handle(p packet.Packet, s *Session, _ *w
 	if af == nil {
 		return nil
 	}
+	if !af.claim() {
+		return nil
+	}
 
-	af.form.OnClose(closeReasonToDDUI(pk.CloseReason))
-
-	s.writePacket(&packet.ClientBoundDataDrivenUICloseScreen{
-		FormID: protocol.Option(af.formID),
-	})
+	af.unbind()
 	sendDataStoreCleanup(s, af)
+	af.form.OnClose(closeReasonToDDUI(pk.CloseReason))
 	return nil
 }
 

@@ -353,6 +353,9 @@ func (s *Session) CloseConnection() {
 	s.connOnce.Do(func() {
 		_ = s.conn.Close()
 		close(s.closeBackground)
+		if s.ddui != nil {
+			s.ddui.discardDDUIForms()
+		}
 	})
 }
 
